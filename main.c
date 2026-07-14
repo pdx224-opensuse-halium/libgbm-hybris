@@ -48,7 +48,7 @@ struct drm_evdi_gbm_del_buff {
 
 struct gbm_hybris_bo {
    struct gbm_bo base;
-//   buffer_handle_t handle;
+   buffer_handle_t handle;
    int evdi_lindroid_buff_id;
 };
 
@@ -90,19 +90,11 @@ static void hybris_gbm_destroy_kernel_bo(struct gbm_hybris_bo *bo)
     if (!bo)
         return;
 
-    if (bo->evdi_lindroid_buff_id <= 0)
-        return;
-
-    if (!bo->base.gbm || bo->base.gbm->v0.fd < 0)
-        goto out_clear;
-
-    close_args.id = bo->evdi_lindroid_buff_id;
-    if (ioctl(bo->base.gbm->v0.fd, DRM_IOCTL_EVDI_GBM_DEL_BUFF, &close_args) < 0 &&
-        errno != ENODEV && errno != EBADF) {
-        perror("[libgbm-hybris] DRM_IOCTL_EVDI_GBM_DEL_BUFF failed");
+    (void)close_args;
+    if (bo->handle) {
+        hybris_gralloc_release(bo->handle, 1);
+        bo->handle = NULL;
     }
-
-out_clear:
     bo->evdi_lindroid_buff_id = -1;
 }
 
@@ -192,20 +184,13 @@ struct gbm_bo* hybris_gbm_bo_create(struct gbm_device* device, uint32_t width, u
     cmd.format = get_hal_pixel_format(format);
     cmd.stride = &stride;
     cmd.id = &bo->evdi_lindroid_buff_id;
-    int ret = ioctl(device->v0.fd, DRM_IOCTL_EVDI_GBM_CREATE_BUFF, &cmd);
-    if (ret < 0) {
-        fprintf(stderr, "[libgbm-hybris] DRM_IOCTL_EVDI_GBM_CREATE_BUFF failed: %s\n", strerror(errno));
+    (void)cmd; (void)device;
+    int aret = hybris_gralloc_allocate(width, height, get_hal_pixel_format(format),
+                 0x100|0x200|0x800|0x1000,
+                 (buffer_handle_t*)&bo->handle, &stride);
+    if (aret != 0 || !bo->handle || stride == 0) {
+        fprintf(stderr, "[libgbm-hybris] hybris_gralloc_allocate failed ret=%d stride=%u\n", aret, stride);
         free(bo);
-        return NULL;
-    }
-
-    if (bo->evdi_lindroid_buff_id <= 0 || stride == 0) {
-        fprintf(stderr,
-                "[libgbm-hybris] Invalid CREATE_BUFF reply: id=%d stride=%u\n",
-                bo->evdi_lindroid_buff_id, stride);
-        hybris_gbm_destroy_kernel_bo(bo);
-        free(bo);
-        errno = EIO;
         return NULL;
     }
 
@@ -357,38 +342,19 @@ int hybris_gbm_bo_get_fd(struct gbm_bo* _bo) {
         return -1;
     }
 
-    if (bo->evdi_lindroid_buff_id <= 0) {
+    if (!bo->handle) {
         errno = EINVAL;
-        printf("[libgbm-hybris] missing evdi_lindroid_buff_id\n");
+        printf("[libgbm-hybris] missing gralloc handle\n");
         return -1;
     }
 
-    int fd = memfd_create("whatever", MFD_CLOEXEC);
-
-    if (fd == -1) {
-        printf("[libgbm-hybris] memfd_create failed\n");
-        return -1;
-    }
-
-    if (write(fd, &bo->evdi_lindroid_buff_id, sizeof(int)) != (ssize_t)sizeof(int)) {
-        errno = EIO;
-        printf("[libgbm-hybris] failed to write evdi_lindroid_buff_id into mefd\n");
-        close(fd);
-        return -1;
-    }
-
-    const size_t size = (size_t)bo->base.v0.stride * bo->base.v0.height;
-    if (size < sizeof(int)) {
+    if (!bo->handle || bo->handle->numFds < 1) {
         errno = EINVAL;
-        close(fd);
+        printf("[libgbm-hybris] gralloc handle has no dmabuf fd\n");
         return -1;
     }
-
-    if (ftruncate(fd, size) < 0) {
-        close(fd);
-        return -1;
-    }
-
+    int fd = dup(bo->handle->data[0]);
+    if (fd < 0) { printf("[libgbm-hybris] dup dmabuf failed\n"); return -1; }
     return fd;
 }
 
@@ -508,9 +474,11 @@ static struct gbm_device *hybris_device_create(int fd, uint32_t gbm_backend_vers
     device = calloc(1, sizeof *device);
     if (!device)
        return NULL;
+   hybris_gralloc_initialize(0);
 
    device->dummy = gbm_device_hybris;
    device->v0.fd = fd;
+   device->v0.name = "hybris";
    device->v0.backend_version = gbm_backend_version;
    device->v0.bo_create = hybris_gbm_bo_create;
    device->v0.bo_destroy = hybris_gbm_bo_destroy;
