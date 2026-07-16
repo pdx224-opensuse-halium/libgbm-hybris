@@ -50,6 +50,7 @@ struct gbm_hybris_bo {
    struct gbm_bo base;
    buffer_handle_t handle;
    int evdi_lindroid_buff_id;
+   uint32_t pixel_stride;   /* gralloc stride in pixels; used by bo_map */
 };
 
 struct gbm_hybris_surface {
@@ -136,6 +137,48 @@ static int get_hal_pixel_format(uint32_t gbm_format)
     return format;
 }
 
+/* Formats we can actually back with a gralloc buffer (mirror of the explicit
+ * cases in get_hal_pixel_format; the default RGBA8888 there is a fallback, not
+ * a claim of support). */
+static bool is_known_gbm_format(uint32_t gbm_format)
+{
+    switch (gbm_format) {
+    case GBM_FORMAT_ABGR8888:
+    case GBM_FORMAT_XBGR8888:
+    case GBM_FORMAT_RGB888:
+    case GBM_FORMAT_RGB565:
+    case GBM_FORMAT_ARGB8888:
+    case GBM_FORMAT_GR88:
+    case GBM_FORMAT_ABGR16161616F:
+    case GBM_FORMAT_ABGR2101010:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* Bytes per pixel for the mappable single-plane formats above. Used only to
+ * compute the CPU map stride/offset in bo_map; the scanout stride in
+ * base.v0.stride is left untouched. */
+static uint32_t hybris_bytes_per_pixel(uint32_t gbm_format)
+{
+    switch (gbm_format) {
+    case GBM_FORMAT_ABGR16161616F:
+        return 8;
+    case GBM_FORMAT_RGB888:
+        return 3;
+    case GBM_FORMAT_RGB565:
+    case GBM_FORMAT_GR88:
+        return 2;
+    case GBM_FORMAT_ABGR8888:
+    case GBM_FORMAT_XBGR8888:
+    case GBM_FORMAT_ARGB8888:
+    case GBM_FORMAT_ABGR2101010:
+    default:
+        return 4;
+    }
+}
+
 int hybris_gbm_bo_get_fd(struct gbm_bo* _bo);
 
 // Dummy func to identify hybris gdb_device/bo/surface
@@ -204,6 +247,7 @@ struct gbm_bo* hybris_gbm_bo_create(struct gbm_device* device, uint32_t width, u
     }
 
     bo->base.v0.stride = (uint32_t)byte_stride;
+    bo->pixel_stride = stride;
 
     bo->base.v0.handle.u32 = (uint32_t)bo->evdi_lindroid_buff_id;
     return &bo->base;
@@ -268,10 +312,43 @@ uint64_t hybris_gbm_bo_get_modifier(struct gbm_bo* bo) {
     return DRM_FORMAT_MOD_LINEAR;
 }
 
-void* hybris_gbm_bo_map(struct gbm_bo *bo, uint32_t x, uint32_t y, uint32_t width, uint32_t height, uint32_t flags, uint32_t *stride, void **map_data) {
-//TBD: Implement based on grlloc lock
-    printf("[libgbm-hybris] gbm_bo_map called with x: %u, y: %u, width: %u, height: %u, flags: %u\n", x, y, width, height, flags);
-    return NULL;
+void* hybris_gbm_bo_map(struct gbm_bo *_bo, uint32_t x, uint32_t y, uint32_t width, uint32_t height, uint32_t flags, uint32_t *stride, void **map_data) {
+    struct gbm_hybris_bo *bo = gbm_hybris_bo(_bo);
+
+    if (!bo || !bo->handle || !stride || !map_data) {
+        errno = EINVAL;
+        return NULL;
+    }
+
+    /* Translate GBM transfer flags to gralloc SW usage. */
+    int usage = 0;
+    if (flags & GBM_BO_TRANSFER_READ)
+        usage |= GRALLOC_USAGE_SW_READ_OFTEN;
+    if (flags & GBM_BO_TRANSFER_WRITE)
+        usage |= GRALLOC_USAGE_SW_WRITE_OFTEN;
+    if (usage == 0)
+        usage = GRALLOC_USAGE_SW_READ_OFTEN;
+
+    void *vaddr = NULL;
+    int ret = hybris_gralloc_lock(bo->handle, usage,
+                                  (int)x, (int)y, (int)width, (int)height, &vaddr);
+    if (ret != 0 || !vaddr) {
+        fprintf(stderr, "[libgbm-hybris] gralloc_lock failed ret=%d\n", ret);
+        errno = EIO;
+        return NULL;
+    }
+
+    /* gralloc maps the whole buffer starting at (0,0); GBM wants a pointer to
+     * the (x,y) origin and the byte stride of the mapped region. Compute the
+     * real byte stride here (pixel_stride * bpp), independent of the x4 scanout
+     * stride in base.v0.stride. */
+    uint32_t bpp = hybris_bytes_per_pixel(bo->base.v0.format);
+    uint32_t byte_stride = bo->pixel_stride * bpp;
+    *stride = byte_stride;
+    /* map_data is opaque to the caller; unmap re-derives the handle from the bo,
+     * so a non-NULL token is all that's needed here. */
+    *map_data = vaddr;
+    return (uint8_t *)vaddr + (size_t)y * byte_stride + (size_t)x * bpp;
 }
 
 void hybris_gbm_surface_destroy(struct gbm_surface *surf) {
@@ -436,12 +513,11 @@ struct gbm_surface *hybris_gbm_surface_create(struct gbm_device *gbm, uint32_t w
     return &surf->base;
 }
 
-void hybris_gbm_bo_unmap(struct gbm_bo* bo, void* map_data) {
-//TBD: Implement using gralloc unlock
-//    printf("[libgbm-hybris] gbm_bo_unmap called\n");
-    if (map_data) {
-        free(map_data);
-    }
+void hybris_gbm_bo_unmap(struct gbm_bo* _bo, void* map_data) {
+    struct gbm_hybris_bo *bo = gbm_hybris_bo(_bo);
+    (void)map_data;   /* map_data was the gralloc vaddr, not a heap pointer */
+    if (bo && bo->handle)
+        hybris_gralloc_unlock(bo->handle);
 }
 
 int hybris_gbm_bo_write(struct gbm_bo *bo, const void *buf, size_t count){
@@ -460,6 +536,33 @@ char *hybris_gbm_format_get_name(uint32_t gbm_format, struct gbm_format_name_des
    desc->name[4] = 0;
 
    return desc->name;
+}
+
+/* Mesa's GBM frontend calls these two through the dispatch table with no NULL
+ * guard (gbm.c gbm_device_is_format_supported / _get_format_modifier_plane_count),
+ * so leaving the slots NULL segfaults any app that probes formats/modifiers.
+ * Provide honest answers for our linear, single-plane, gralloc-backed formats. */
+static int hybris_gbm_is_format_supported(struct gbm_device *gbm,
+                                          uint32_t format, uint32_t usage)
+{
+    (void)gbm; (void)usage;
+    if (core && core->v0.format_canonicalize)
+        format = core->v0.format_canonicalize(format);
+    return is_known_gbm_format(format) ? 1 : 0;
+}
+
+static int hybris_gbm_get_format_modifier_plane_count(struct gbm_device *gbm,
+                                                      uint32_t format,
+                                                      uint64_t modifier)
+{
+    (void)gbm;
+    if (core && core->v0.format_canonicalize)
+        format = core->v0.format_canonicalize(format);
+    if (!is_known_gbm_format(format))
+        return 0;
+    if (modifier != DRM_FORMAT_MOD_LINEAR && modifier != DRM_FORMAT_MOD_INVALID)
+        return 0;
+    return 1;   /* all supported formats are single-plane linear */
 }
 
 static struct gbm_device *hybris_device_create(int fd, uint32_t gbm_backend_version){
@@ -496,6 +599,13 @@ static struct gbm_device *hybris_device_create(int fd, uint32_t gbm_backend_vers
    device->v0.surface_has_free_buffers = hybris_gbm_surface_has_free_buffers;
    device->v0.bo_get_offset = hybris_bo_get_offset;
    device->v0.bo_write = hybris_gbm_bo_write;
+   /* Previously-NULL slots — leaving these unset segfaulted apps that probe
+    * formats or map/import BOs (Mesa calls them unguarded). */
+   device->v0.is_format_supported = hybris_gbm_is_format_supported;
+   device->v0.get_format_modifier_plane_count = hybris_gbm_get_format_modifier_plane_count;
+   device->v0.bo_import = hybris_gbm_bo_import;
+   device->v0.bo_map = hybris_gbm_bo_map;
+   device->v0.bo_unmap = hybris_gbm_bo_unmap;
    return device;
 }
 
