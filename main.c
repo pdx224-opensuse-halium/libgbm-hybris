@@ -51,6 +51,14 @@ struct gbm_hybris_bo {
    buffer_handle_t handle;
    int evdi_lindroid_buff_id;
    uint32_t pixel_stride;   /* gralloc stride in pixels; used by bo_map */
+   /* Imported (foreign dma-buf) bo's: created by bo_import, NOT gralloc-backed.
+    * Used for the DRI3 PixmapFromBuffers path (Xwayland glamor importing a
+    * client's kgsl WSI dma-buf). handle stays NULL; the buffer lives in
+    * import_fd and is turned into an EGLImage via EGL_LINUX_DMA_BUF import. */
+   bool imported;
+   int import_fd;            /* owned dma-buf fd (-1 if not imported) */
+   uint64_t import_modifier; /* modifier reported for the imported buffer */
+   uint32_t import_offset;   /* plane-0 byte offset for the imported buffer */
 };
 
 struct gbm_hybris_surface {
@@ -92,6 +100,13 @@ static void hybris_gbm_destroy_kernel_bo(struct gbm_hybris_bo *bo)
         return;
 
     (void)close_args;
+    if (bo->imported) {
+        if (bo->import_fd >= 0) {
+            close(bo->import_fd);
+            bo->import_fd = -1;
+        }
+        return;   /* no gralloc handle to release for imported bo's */
+    }
     if (bo->handle) {
         hybris_gralloc_release(bo->handle, 1);
         bo->handle = NULL;
@@ -208,6 +223,7 @@ struct gbm_bo* hybris_gbm_bo_create(struct gbm_device* device, uint32_t width, u
     }
 
     bo->evdi_lindroid_buff_id = -1;
+    bo->import_fd = -1;   /* not an imported bo */
     bo->base.v0.user_data = NULL;
 
     format = core->v0.format_canonicalize(format);
@@ -283,10 +299,68 @@ struct gbm_bo * hybris_gbm_bo_create_with_modifiers2(struct gbm_device *gbm, uin
     return hybris_gbm_bo_create(gbm, width, height, format, flags, NULL, 0);
 }
 
-struct gbm_bo *hybris_gbm_bo_import(struct gbm_device *gbm, uint32_t type, void *buffer, uint32_t usage){
-// How do that even work with fake dma buf's?
-   printf("[libgbm-hybris] gbm_bo_import called\n");
-   return NULL;
+/* Import a foreign dma-buf into a THIN, non-gralloc bo. This is what lets
+ * Xwayland's glamor accept a client's DRI3 PixmapFromBuffers request: glamor
+ * calls gbm_bo_import(FD_MODIFIER) with the client's kgsl WSI dma-buf, and the
+ * resulting bo is turned into an EGLImage via the EGL_LINUX_DMA_BUF path in
+ * libEGL (platform_drm.c hybris branch) — i.e. Turnip external-memory import,
+ * NOT gralloc. Single-plane only (our formats are single-plane linear). */
+struct gbm_bo *hybris_gbm_bo_import(struct gbm_device *gbm, uint32_t type,
+                                    void *buffer, uint32_t usage)
+{
+   (void)usage;
+   if (!gbm || !buffer) { errno = EINVAL; return NULL; }
+
+   uint32_t w, h, fmt, stride, offset = 0;
+   uint64_t modifier = DRM_FORMAT_MOD_LINEAR;
+   int src_fd = -1;
+
+   if (type == GBM_BO_IMPORT_FD_MODIFIER) {
+      struct gbm_import_fd_modifier_data *d = buffer;
+      if (d->num_fds != 1) {
+         fprintf(stderr, "[libgbm-hybris] bo_import: %u planes unsupported\n",
+                 d->num_fds);
+         errno = ENOSYS; return NULL;
+      }
+      w = d->width; h = d->height; fmt = d->format;
+      stride = (uint32_t)d->strides[0]; offset = (uint32_t)d->offsets[0];
+      modifier = d->modifier; src_fd = d->fds[0];
+   } else if (type == GBM_BO_IMPORT_FD) {
+      struct gbm_import_fd_data *d = buffer;
+      w = d->width; h = d->height; fmt = d->format;
+      stride = d->stride; src_fd = d->fd;
+   } else {
+      fprintf(stderr, "[libgbm-hybris] bo_import: type 0x%x unsupported\n", type);
+      errno = ENOSYS; return NULL;
+   }
+
+   if (src_fd < 0) { errno = EINVAL; return NULL; }
+
+   if (core && core->v0.format_canonicalize)
+      fmt = core->v0.format_canonicalize(fmt);
+
+   struct gbm_hybris_bo *bo = calloc(1, sizeof(*bo));
+   if (!bo) { errno = ENOMEM; return NULL; }
+
+   bo->import_fd = dup(src_fd);   /* we own our own reference */
+   if (bo->import_fd < 0) {
+      int e = errno ? errno : EBADF;
+      free(bo); errno = e; return NULL;
+   }
+
+   bo->imported = true;
+   bo->handle = NULL;
+   bo->evdi_lindroid_buff_id = -1;
+   bo->base.gbm = gbm;
+   bo->base.v0.width = w;
+   bo->base.v0.height = h;
+   bo->base.v0.format = fmt;
+   bo->base.v0.stride = stride;
+   bo->base.v0.handle.u32 = 0;
+   bo->pixel_stride = stride / hybris_bytes_per_pixel(fmt);
+   bo->import_modifier = modifier;
+   bo->import_offset = offset;
+   return &bo->base;
 }
 
 // Suprisingly not part of libgbm
@@ -309,6 +383,9 @@ uint32_t hybris_gbm_bo_get_stride_for_plane(struct gbm_bo *bo, int plane)
 }
 
 uint64_t hybris_gbm_bo_get_modifier(struct gbm_bo* bo) {
+    struct gbm_hybris_bo *hbo = gbm_hybris_bo(bo);
+    if (hbo && hbo->imported)
+        return hbo->import_modifier;
     return DRM_FORMAT_MOD_LINEAR;
 }
 
@@ -413,6 +490,14 @@ int hybris_gbm_bo_get_fd(struct gbm_bo* _bo) {
         return -1;
     }
 
+    /* Imported bo: return a dup of the foreign dma-buf fd (no gralloc handle). */
+    if (bo->imported) {
+        if (bo->import_fd < 0) { errno = EINVAL; return -1; }
+        int ifd = dup(bo->import_fd);
+        if (ifd < 0) { printf("[libgbm-hybris] dup imported dmabuf failed\n"); return -1; }
+        return ifd;
+    }
+
     if (!_bo->gbm || _bo->gbm->v0.fd < 0) {
         errno = EBADF;
         printf("[libgbm-hybris] invalid gbm device/fd\n");
@@ -461,6 +546,9 @@ int hybris_gbm_bo_get_fd_for_plane(struct gbm_bo *bo, int plane)
 uint32_t hybris_bo_get_offset(struct gbm_bo *bo, int plane)
 {
 //   printf("[libgbm-hybris] gbm_bo_get_offset called\n");
+   struct gbm_hybris_bo *hbo = gbm_hybris_bo(bo);
+   if (hbo && hbo->imported)
+      return hbo->import_offset;
    return 0;
 }
 
