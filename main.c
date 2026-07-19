@@ -225,12 +225,24 @@ static struct gbm_device *gbm_device_hybris(int x)
  * compressed content is not CPU-mappable. */
 #define GRALLOC_USAGE_PRIVATE_ALLOC_UBWC 0x10000000u
 
-static bool hybris_gbm_ubwc_enabled(void)
+/* 0 = off, 1 = on (honor GBM_BO_USE_LINEAR), 2 = force: also override
+ * GBM_BO_USE_LINEAR for GPU-only bos. The force level exists because sde-kms
+ * exposes no IN_FORMATS plane property, so KWin cannot discover that UBWC is
+ * scanout-capable and defensively requests linear render targets — but it
+ * reads the bo's *actual* modifier back via gbm_bo_get_modifier for both its
+ * EGL dmabuf import and AddFB2WithModifiers, so overriding is coherent.
+ * WRITE/CURSOR bos always stay linear (CPU access). */
+static int hybris_gbm_ubwc_enabled(void)
 {
     static int enabled = -1;
     if (enabled < 0) {
         const char *e = getenv("GBM_HYBRIS_UBWC");
-        enabled = (e && e[0] == '1') ? 1 : 0;
+        if (!e)
+            enabled = 0;
+        else if (!strcmp(e, "force"))
+            enabled = 2;
+        else
+            enabled = (e[0] == '1') ? 1 : 0;
     }
     return enabled;
 }
@@ -296,11 +308,16 @@ struct gbm_bo* hybris_gbm_bo_create(struct gbm_device* device, uint32_t width, u
      * Anything CPU-touched (WRITE/LINEAR) or a cursor stays linear, and
      * HW_FB is dropped for UBWC (framebuffer usage forces linear in
      * gralloc). */
-    if (hybris_gbm_ubwc_enabled() &&
-        hybris_gbm_format_supports_ubwc(format) &&
-        !(flags & (GBM_BO_USE_WRITE | GBM_BO_USE_LINEAR | GBM_BO_USE_CURSOR))) {
-        usage = 0x100u | 0x200u | 0x800u | GRALLOC_USAGE_PRIVATE_ALLOC_UBWC;
-        bo->ubwc = true;
+    {
+        int ubwc_mode = hybris_gbm_ubwc_enabled();
+        uint32_t linear_flags = GBM_BO_USE_WRITE | GBM_BO_USE_CURSOR;
+        if (ubwc_mode < 2)
+            linear_flags |= GBM_BO_USE_LINEAR;
+        if (ubwc_mode && hybris_gbm_format_supports_ubwc(format) &&
+            !(flags & linear_flags)) {
+            usage = 0x100u | 0x200u | 0x800u | GRALLOC_USAGE_PRIVATE_ALLOC_UBWC;
+            bo->ubwc = true;
+        }
     }
     int aret = hybris_gralloc_allocate(width, height, get_hal_pixel_format(format),
                  (int)usage,
