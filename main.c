@@ -63,6 +63,15 @@ struct gbm_hybris_bo {
 
 struct gbm_hybris_surface {
     struct gbm_surface base;
+    /* Mesa's EGL drm platform casts every gbm_surface to its own
+     * struct gbm_dri_surface { struct gbm_surface base; void *dri_private; }
+     * and stores its dri2_egl_surface pointer in dri_private
+     * (dri2_drm_create_window_surface). Keep an explicit slot at exactly that
+     * offset so the write lands in a field we own instead of silently
+     * clobbering whatever comes first — previously that was front_bo, which
+     * only worked because Mesa also overrides the three surface callbacks
+     * that read it. DO NOT move this field: it must directly follow base. */
+    void *dri_private;
     struct gbm_hybris_bo *front_bo;
     bool front_locked;
     struct gbm_hybris_bo *bo[16];
@@ -185,6 +194,8 @@ static uint32_t hybris_bytes_per_pixel(uint32_t gbm_format)
     case GBM_FORMAT_RGB565:
     case GBM_FORMAT_GR88:
         return 2;
+    case GBM_FORMAT_R8:
+        return 1;
     case GBM_FORMAT_ABGR8888:
     case GBM_FORMAT_XBGR8888:
     case GBM_FORMAT_ARGB8888:
@@ -430,12 +441,13 @@ void* hybris_gbm_bo_map(struct gbm_bo *_bo, uint32_t x, uint32_t y, uint32_t wid
 
 void hybris_gbm_surface_destroy(struct gbm_surface *surf) {
     struct gbm_hybris_surface *hsurf = (struct gbm_hybris_surface *)surf;
-    int i;
 
     if (!hsurf)
         return;
 
-    // We own nothing
+    /* the bo's belong to the EGL consumer; we own only the modifier array
+     * allocated in surface_create */
+    free(hsurf->base.v0.modifiers);
     free(hsurf);
 }
 
@@ -443,10 +455,9 @@ int hybris_gbm_surface_has_free_buffers(struct gbm_surface *surface)
 {
     struct gbm_hybris_surface *hsurf = (struct gbm_hybris_surface *)surface;
 
-    if(hsurf->front_locked)
-        return 1;
-
-    return 0;
+    /* a buffer is free to lock when the front is NOT currently locked
+     * (note: dead code under Mesa EGL, which overrides this callback) */
+    return hsurf->front_locked ? 0 : 1;
 }
 
 struct gbm_bo* hybris_gbm_surface_lock_front_buffer(struct gbm_surface* surface) {
