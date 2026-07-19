@@ -59,6 +59,7 @@ struct gbm_hybris_bo {
    int import_fd;            /* owned dma-buf fd (-1 if not imported) */
    uint64_t import_modifier; /* modifier reported for the imported buffer */
    uint32_t import_offset;   /* plane-0 byte offset for the imported buffer */
+   bool ubwc;                /* allocated UBWC -> modifier QCOM_COMPRESSED */
 };
 
 struct gbm_hybris_surface {
@@ -213,6 +214,40 @@ static struct gbm_device *gbm_device_hybris(int x)
     return NULL;
 }
 
+/* pdx224 UBWC: opt-in (GBM_HYBRIS_UBWC=1) allocation of Adreno/SDE-compressed
+ * (DRM_FORMAT_MOD_QCOM_COMPRESSED) buffers via the gralloc private usage bit.
+ * Validated on-device: gralloc lays the buffer out exactly as both Turnip
+ * (fdl6 UBWC import via the QCOM_COMPRESSED modifier) and downstream sde-kms
+ * (AddFB2WithModifiers; it computes the meta/pixel plane split internally
+ * from width/height and ignores userspace offsets) expect. Only ABGR-order
+ * formats: the sde UBWC format catalog rejects RGB-order (ARGB/XRGB)
+ * variants. CPU-touched buffers (WRITE/LINEAR/CURSOR gbm flags) stay linear:
+ * compressed content is not CPU-mappable. */
+#define GRALLOC_USAGE_PRIVATE_ALLOC_UBWC 0x10000000u
+
+static bool hybris_gbm_ubwc_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *e = getenv("GBM_HYBRIS_UBWC");
+        enabled = (e && e[0] == '1') ? 1 : 0;
+    }
+    return enabled;
+}
+
+static bool hybris_gbm_format_supports_ubwc(uint32_t format)
+{
+    switch (format) {
+    case GBM_FORMAT_ABGR8888:
+    case GBM_FORMAT_XBGR8888:
+    case GBM_FORMAT_ABGR2101010:
+    case GBM_FORMAT_XBGR2101010:
+        return true;
+    default:
+        return false;
+    }
+}
+
 struct gbm_bo* hybris_gbm_bo_create(struct gbm_device* device, uint32_t width, uint32_t height, uint32_t format, uint32_t flags, const uint64_t *modifiers, const unsigned int count) {
     if (!device) {
         errno = EINVAL;
@@ -255,8 +290,20 @@ struct gbm_bo* hybris_gbm_bo_create(struct gbm_device* device, uint32_t width, u
     cmd.stride = &stride;
     cmd.id = &bo->evdi_lindroid_buff_id;
     (void)cmd; (void)device;
+    /* HW_TEXTURE | HW_RENDER | HW_COMPOSER | HW_FB */
+    uint32_t usage = 0x100u | 0x200u | 0x800u | 0x1000u;
+    /* pdx224 UBWC: GPU/scanout-only ABGR-order buffers may be compressed.
+     * Anything CPU-touched (WRITE/LINEAR) or a cursor stays linear, and
+     * HW_FB is dropped for UBWC (framebuffer usage forces linear in
+     * gralloc). */
+    if (hybris_gbm_ubwc_enabled() &&
+        hybris_gbm_format_supports_ubwc(format) &&
+        !(flags & (GBM_BO_USE_WRITE | GBM_BO_USE_LINEAR | GBM_BO_USE_CURSOR))) {
+        usage = 0x100u | 0x200u | 0x800u | GRALLOC_USAGE_PRIVATE_ALLOC_UBWC;
+        bo->ubwc = true;
+    }
     int aret = hybris_gralloc_allocate(width, height, get_hal_pixel_format(format),
-                 0x100|0x200|0x800|0x1000,
+                 (int)usage,
                  (buffer_handle_t*)&bo->handle, &stride);
     if (aret != 0 || !bo->handle || stride == 0) {
         fprintf(stderr, "[libgbm-hybris] hybris_gralloc_allocate failed ret=%d stride=%u\n", aret, stride);
@@ -397,6 +444,8 @@ uint64_t hybris_gbm_bo_get_modifier(struct gbm_bo* bo) {
     struct gbm_hybris_bo *hbo = gbm_hybris_bo(bo);
     if (hbo && hbo->imported)
         return hbo->import_modifier;
+    if (hbo && hbo->ubwc)
+        return DRM_FORMAT_MOD_QCOM_COMPRESSED;
     return DRM_FORMAT_MOD_LINEAR;
 }
 
@@ -404,6 +453,12 @@ void* hybris_gbm_bo_map(struct gbm_bo *_bo, uint32_t x, uint32_t y, uint32_t wid
     struct gbm_hybris_bo *bo = gbm_hybris_bo(_bo);
 
     if (!bo || !bo->handle || !stride || !map_data) {
+        errno = EINVAL;
+        return NULL;
+    }
+
+    /* UBWC content is compressed — a linear CPU view does not exist */
+    if (bo->ubwc) {
         errno = EINVAL;
         return NULL;
     }
