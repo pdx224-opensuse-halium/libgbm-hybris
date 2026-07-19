@@ -305,10 +305,36 @@ struct gbm_bo* hybris_gbm_bo_create(struct gbm_device* device, uint32_t width, u
     /* HW_TEXTURE | HW_RENDER | HW_COMPOSER | HW_FB */
     uint32_t usage = 0x100u | 0x200u | 0x800u | 0x1000u;
     /* pdx224 UBWC: GPU/scanout-only ABGR-order buffers may be compressed.
-     * Anything CPU-touched (WRITE/LINEAR) or a cursor stays linear, and
-     * HW_FB is dropped for UBWC (framebuffer usage forces linear in
-     * gralloc). */
-    {
+     * Anything CPU-touched (WRITE/CURSOR) stays linear, and HW_FB is
+     * dropped for UBWC (framebuffer usage forces linear in gralloc).
+     *
+     * An explicit modifier list (gbm_bo_create_with_modifiers*, e.g. KWin
+     * once the kernel exposes IN_FORMATS) is honored on its own — the
+     * caller negotiated those modifiers with the display: pick
+     * QCOM_COMPRESSED when listed and eligible, else LINEAR/implicit when
+     * listed, else fail. Without a list, allocation is governed by
+     * GBM_HYBRIS_UBWC (see hybris_gbm_ubwc_enabled). */
+    if (modifiers && count > 0) {
+        bool want_ubwc = false, want_linear = false;
+        unsigned int mi;
+        for (mi = 0; mi < count; mi++) {
+            if (modifiers[mi] == DRM_FORMAT_MOD_QCOM_COMPRESSED)
+                want_ubwc = true;
+            else if (modifiers[mi] == DRM_FORMAT_MOD_LINEAR ||
+                     modifiers[mi] == DRM_FORMAT_MOD_INVALID)
+                want_linear = true;
+        }
+        if (want_ubwc && hybris_gbm_format_supports_ubwc(format) &&
+            !(flags & (GBM_BO_USE_WRITE | GBM_BO_USE_CURSOR))) {
+            usage = 0x100u | 0x200u | 0x800u | GRALLOC_USAGE_PRIVATE_ALLOC_UBWC;
+            bo->ubwc = true;
+        } else if (!want_linear) {
+            /* none of the requested modifiers can be satisfied */
+            free(bo);
+            errno = EINVAL;
+            return NULL;
+        }
+    } else {
         int ubwc_mode = hybris_gbm_ubwc_enabled();
         uint32_t linear_flags = GBM_BO_USE_WRITE | GBM_BO_USE_CURSOR;
         if (ubwc_mode < 2)
@@ -365,13 +391,13 @@ struct gbm_bo *hybris_gbm_bo_create_with_modifiers(struct gbm_device *gbm,
                              const uint64_t *modifiers,
                              const unsigned int count)
 {
-   /* Force linear: ignore modifier list and allocate a normal BO */
-   return hybris_gbm_bo_create(gbm, width, height, format, 0, NULL, 0);
+   /* forward the caller's negotiated modifier list (see bo_create) */
+   return hybris_gbm_bo_create(gbm, width, height, format, 0, modifiers, count);
 }
 
 struct gbm_bo * hybris_gbm_bo_create_with_modifiers2(struct gbm_device *gbm, uint32_t width, uint32_t height, uint32_t format, const uint64_t *modifiers, const unsigned int count, uint32_t flags){
-    /* Force linear: ignore modifier list and allocate a normal BO */
-    return hybris_gbm_bo_create(gbm, width, height, format, flags, NULL, 0);
+    /* forward the caller's negotiated modifier list (see bo_create) */
+    return hybris_gbm_bo_create(gbm, width, height, format, flags, modifiers, count);
 }
 
 /* Import a foreign dma-buf into a THIN, non-gralloc bo. This is what lets
