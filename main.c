@@ -59,7 +59,17 @@ struct gbm_hybris_bo {
    int import_fd;            /* owned dma-buf fd (-1 if not imported) */
    uint64_t import_modifier; /* modifier reported for the imported buffer */
    uint32_t import_offset;   /* plane-0 byte offset for the imported buffer */
+   /* Multi-plane semi-planar imports (e.g. NV12): all planes share import_fd; store per-plane
+    * layout so callers (Chromium) that import an NV12 dma-buf as 2 planes get correct info. */
+   int      import_planes;   /* >=1 for imported bo (1 if single-plane) */
+   uint32_t import_strides[4];
+   uint32_t import_offsets[4];
    bool ubwc;                /* allocated UBWC -> modifier QCOM_COMPRESSED */
+   /* Real msm GEM handle, lazily created by importing the buffer's dma-buf into the DRM device
+    * (drmPrimeFDToHandle) so callers that do drmPrimeHandleToFD(get_handle_for_plane()) — e.g.
+    * Chromium's gbm_wrapper — get a valid per-plane fd instead of ENOENT on the gralloc id. */
+   uint32_t gem_handle;
+   bool gem_handle_valid;
 };
 
 struct gbm_hybris_surface {
@@ -376,6 +386,10 @@ static void hybris_gbm_bo_destroy(struct gbm_bo *_bo)
         return;
 
     struct gbm_hybris_bo *bo = gbm_hybris_bo(_bo);
+    if (bo->gem_handle_valid && _bo->gbm && _bo->gbm->v0.fd >= 0) {
+        struct drm_gem_close gc = { .handle = bo->gem_handle };
+        drmIoctl(_bo->gbm->v0.fd, DRM_IOCTL_GEM_CLOSE, &gc);   /* drop the imported GEM ref */
+    }
     hybris_gbm_destroy_kernel_bo(bo);
     free(bo);
 }
@@ -415,14 +429,20 @@ struct gbm_bo *hybris_gbm_bo_import(struct gbm_device *gbm, uint32_t type,
    uint32_t w, h, fmt, stride, offset = 0;
    uint64_t modifier = DRM_FORMAT_MOD_LINEAR;
    int src_fd = -1;
+   int nplanes = 1;
+   uint32_t pstrides[4] = {0}, poffsets[4] = {0};
 
    if (type == GBM_BO_IMPORT_FD_MODIFIER) {
       struct gbm_import_fd_modifier_data *d = buffer;
-      if (d->num_fds != 1) {
-         fprintf(stderr, "[libgbm-hybris] bo_import: %u planes unsupported\n",
-                 d->num_fds);
+      /* Semi-planar formats (NV12) come in as 2 "planes" that all live in ONE dma-buf: Chromium
+       * passes num_fds==planes with every fds[i] referencing the same buffer. Accept up to 4 and
+       * use fds[0]; keep per-plane strides/offsets so plane queries return correct values. */
+      if (d->num_fds < 1 || d->num_fds > 4) {
+         fprintf(stderr, "[libgbm-hybris] bo_import: %u planes unsupported\n", d->num_fds);
          errno = ENOSYS; return NULL;
       }
+      nplanes = (int)d->num_fds;
+      for (int i = 0; i < nplanes; i++) { pstrides[i] = (uint32_t)d->strides[i]; poffsets[i] = (uint32_t)d->offsets[i]; }
       w = d->width; h = d->height; fmt = d->format;
       stride = (uint32_t)d->strides[0]; offset = (uint32_t)d->offsets[0];
       modifier = d->modifier; src_fd = d->fds[0];
@@ -430,6 +450,7 @@ struct gbm_bo *hybris_gbm_bo_import(struct gbm_device *gbm, uint32_t type,
       struct gbm_import_fd_data *d = buffer;
       w = d->width; h = d->height; fmt = d->format;
       stride = d->stride; src_fd = d->fd;
+      pstrides[0] = stride; poffsets[0] = 0;
    } else {
       fprintf(stderr, "[libgbm-hybris] bo_import: type 0x%x unsupported\n", type);
       errno = ENOSYS; return NULL;
@@ -461,6 +482,8 @@ struct gbm_bo *hybris_gbm_bo_import(struct gbm_device *gbm, uint32_t type,
    bo->pixel_stride = stride / hybris_bytes_per_pixel(fmt);
    bo->import_modifier = modifier;
    bo->import_offset = offset;
+   bo->import_planes = nplanes;
+   for (int i = 0; i < nplanes; i++) { bo->import_strides[i] = pstrides[i]; bo->import_offsets[i] = poffsets[i]; }
    return &bo->base;
 }
 
@@ -475,6 +498,11 @@ uint32_t hybris_gbm_bo_get_stride_for_plane(struct gbm_bo *bo, int plane)
     if (!bo) {
         errno = EINVAL;
         return 0;
+    }
+    struct gbm_hybris_bo *hbo = gbm_hybris_bo(bo);
+    if (hbo && hbo->imported && hbo->import_planes > 0) {
+        if (plane < 0 || plane >= hbo->import_planes) { errno = EINVAL; return 0; }
+        return hbo->import_strides[plane];
     }
     if (plane != 0) {
         errno = EINVAL;
@@ -632,32 +660,66 @@ int hybris_gbm_bo_get_fd(struct gbm_bo* _bo) {
 static union gbm_bo_handle hybris_gbm_bo_get_handle_for_plane(struct gbm_bo *_bo, int plane)
 {
     union gbm_bo_handle handle;
-    handle.u32 = _bo->v0.handle.u32;
+    struct gbm_hybris_bo *bo = gbm_hybris_bo(_bo);
+    handle.u32 = _bo->v0.handle.u32;   /* legacy gralloc id (fallback) */
+
+    /* Chromium (ui/gfx/linux/gbm_wrapper.cc) obtains each plane's dma-buf fd via
+     * drmPrimeHandleToFD(gbm_device_fd, get_handle_for_plane().u32). A gralloc id is not a GEM
+     * handle, so that ioctl returns ENOENT ("Failed to get fd for plane with libdrm") and the
+     * whole zero-copy path (SharedImage / NativePixmap, incl. VA-API video frames) fails. Import
+     * the underlying dma-buf into THIS bo's DRM device to mint a real GEM handle Chromium can
+     * re-export. The device fd here is the same one Chromium uses for drmPrimeHandleToFD, so the
+     * handle is valid in its namespace. Cache per-bo (closed in bo_destroy) to avoid leaking. */
+    if (plane == 0 && _bo->gbm && _bo->gbm->v0.fd >= 0) {
+        if (bo->gem_handle_valid) { handle.u32 = bo->gem_handle; return handle; }
+        int dmabuf = -1;
+        if (bo->imported)
+            dmabuf = bo->import_fd;
+        else if (bo->handle && bo->handle->numFds >= 1)
+            dmabuf = bo->handle->data[0];
+        if (dmabuf >= 0) {
+            uint32_t gem = 0;
+            if (drmPrimeFDToHandle(_bo->gbm->v0.fd, dmabuf, &gem) == 0 && gem) {
+                bo->gem_handle = gem;
+                bo->gem_handle_valid = true;
+                handle.u32 = gem;
+            } else {
+                fprintf(stderr, "[libgbm-hybris] drmPrimeFDToHandle failed: %s\n", strerror(errno));
+            }
+        }
+    }
     return handle;
 }
 
 int hybris_gbm_bo_get_plane_count(struct gbm_bo *bo)
 {
+    struct gbm_hybris_bo *hbo = gbm_hybris_bo(bo);
+    if (hbo && hbo->imported && hbo->import_planes > 0)
+        return hbo->import_planes;      /* e.g. 2 for an imported NV12 */
     return 1;
 }
 
 int hybris_gbm_bo_get_fd_for_plane(struct gbm_bo *bo, int plane)
 {
-    if (plane != 0) {
-        fprintf(stderr, "[libgbm-hybris] Error: requested plane %d, only 0 is supported\n", plane);
+    struct gbm_hybris_bo *hbo = gbm_hybris_bo(bo);
+    int planes = (hbo && hbo->imported && hbo->import_planes > 0) ? hbo->import_planes : 1;
+    if (plane < 0 || plane >= planes) {
+        fprintf(stderr, "[libgbm-hybris] Error: requested plane %d of %d\n", plane, planes);
         errno = EINVAL;
         return -1;
     }
-
+    /* All planes of a semi-planar buffer share the same underlying dma-buf. */
     return hybris_gbm_bo_get_fd(bo);
 }
 
 uint32_t hybris_bo_get_offset(struct gbm_bo *bo, int plane)
 {
-//   printf("[libgbm-hybris] gbm_bo_get_offset called\n");
    struct gbm_hybris_bo *hbo = gbm_hybris_bo(bo);
-   if (hbo && hbo->imported)
+   if (hbo && hbo->imported) {
+      if (plane >= 0 && plane < hbo->import_planes)
+         return hbo->import_offsets[plane];
       return hbo->import_offset;
+   }
    return 0;
 }
 
