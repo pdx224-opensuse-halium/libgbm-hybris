@@ -257,6 +257,18 @@ static int hybris_gbm_ubwc_enabled(void)
     return enabled;
 }
 
+/* pdx224: PDX224_GBM_HYBRIS_DEBUG=1 -> log each bo_create. Off by default; this
+ * library is in the path of every allocation the compositor makes. */
+static bool hybris_gbm_debug(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("PDX224_GBM_HYBRIS_DEBUG");
+        on = (e && e[0] == '1') ? 1 : 0;
+    }
+    return on == 1;
+}
+
 static bool hybris_gbm_format_supports_ubwc(uint32_t format)
 {
     switch (format) {
@@ -364,7 +376,30 @@ struct gbm_bo* hybris_gbm_bo_create(struct gbm_device* device, uint32_t width, u
         return NULL;
     }
 
-    byte_stride = (uint64_t)stride * 4u;
+    /* pdx224 2026-09-11: gralloc returns `stride` in PIXELS. This used to be
+     * multiplied by a hardcoded 4 with the justification "drm expects stride to
+     * be at very least width*bpp" -- which is exactly right for the 32-bpp
+     * formats and silently wrong for every other one.
+     *
+     * It went unnoticed because the only in-tree consumer was KWin, which
+     * allocates ABGR/XBGR8888 and nothing else, and 4 IS the correct bpp there.
+     * Chromium/Ozone does not: it allocates in several formats and passes
+     * gbm_bo_get_stride() verbatim into zwp_linux_buffer_params.add(). A stride
+     * that is 2x or 4x the real pitch makes the compositor sample the buffer
+     * with the wrong row length, which renders as a horizontal shear with the
+     * image duplicated at an offset -- the Vivaldi corruption root-caused today.
+     *
+     * hybris_bytes_per_pixel() already existed for the CPU map path and covers
+     * every format is_known_gbm_format() accepts, so this is just using it.
+     * For ABGR8888/XBGR8888/ARGB8888/ABGR2101010 the result is bit-identical to
+     * the old expression, so KWin's behaviour does not change at all.
+     *
+     * NOT fixed here, deliberately: GBM_FORMAT_GR88 maps to HAL_PIXEL_FORMAT_YV12,
+     * a PLANAR format whose gralloc stride is the luma pitch in pixels (1 byte
+     * per sample), so neither 2 nor 4 is right for it. That mapping is wrong at
+     * a deeper level than the stride and is left alone rather than papered over;
+     * nothing in this stack allocates GR88 through gbm today. */
+    byte_stride = (uint64_t)stride * (uint64_t)hybris_bytes_per_pixel(format);
     if (byte_stride == 0 || byte_stride > UINT32_MAX) {
         fprintf(stderr, "[libgbm-hybris] Computed byte stride overflow: stride=%u\n", stride);
         hybris_gbm_destroy_kernel_bo(bo);
@@ -375,6 +410,25 @@ struct gbm_bo* hybris_gbm_bo_create(struct gbm_device* device, uint32_t width, u
 
     bo->base.v0.stride = (uint32_t)byte_stride;
     bo->pixel_stride = stride;
+
+    /* pdx224: PDX224_GBM_HYBRIS_DEBUG=1 logs every allocation. The stride bug
+     * above cost an evening of guessing because there was no way to see what a
+     * client actually asked for versus what it got back; this is that. */
+    if (hybris_gbm_debug()) {
+        char mods[128] = "none";
+        if (count && modifiers) {
+            int n = 0;
+            for (unsigned mi = 0; mi < count && n < (int)sizeof(mods) - 24; mi++)
+                n += snprintf(mods + n, sizeof(mods) - n, "0x%llx ",
+                              (unsigned long long)modifiers[mi]);
+        }
+        fprintf(stderr, "[libgbm-hybris] bo_create %ux%u fmt=%.4s(0x%08x) "
+                        "flags=0x%x bpp=%u px_stride=%u byte_stride=%u "
+                        "ubwc=%d req_mods=[%s]\n",
+                width, height, (const char *)&format, format, flags,
+                hybris_bytes_per_pixel(format), stride,
+                (uint32_t)byte_stride, bo->ubwc ? 1 : 0, mods);
+    }
 
     bo->base.v0.handle.u32 = (uint32_t)bo->evdi_lindroid_buff_id;
     return &bo->base;
@@ -488,8 +542,12 @@ struct gbm_bo *hybris_gbm_bo_import(struct gbm_device *gbm, uint32_t type,
 }
 
 // Suprisingly not part of libgbm
+/* pdx224: base.v0.stride is the plane-0 BYTE stride, now computed from the
+ * format's real bytes-per-pixel in bo_create() rather than a hardcoded 4.
+ * Note this function ignores `plane` -- that is why it must NOT be the one wired
+ * into device->v0.bo_get_stride; see hybris_gbm_bo_get_stride_for_plane(). */
 uint32_t hybris_gbm_bo_get_stride(struct gbm_bo* bo, int plane) {
-    // x4 the stride, as it's checked by drm and drm expexcts stride to be at very least width*bpp
+    (void)plane;
     return bo ? (uint32_t)(bo->v0.stride) : 0;
 }
 
@@ -819,9 +877,23 @@ static int hybris_gbm_get_format_modifier_plane_count(struct gbm_device *gbm,
         format = core->v0.format_canonicalize(format);
     if (!is_known_gbm_format(format))
         return 0;
+    /* pdx224: QCOM_COMPRESSED must be accepted here. bo_create() has allocated
+     * UBWC via GRALLOC_USAGE_PRIVATE_ALLOC_UBWC since the UBWC work landed, and
+     * bo_get_modifier() reports QCOM_COMPRESSED for those bos -- but this query
+     * still answered 0 ("unsupported"), so the allocator and the capability
+     * query disagreed. A caller that asks before allocating (Chromium/Ozone does,
+     * to build its NativePixmapHandle) is told UBWC is impossible.
+     *
+     * The count is 1, not 2: UBWC is single-plane from userspace's point of view
+     * here. gralloc packs the meta and pixel planes into one buffer and sde-kms
+     * recomputes the split internally from width/height, ignoring userspace
+     * offsets -- which is also why bo_get_offset() returning 0 is correct for
+     * these and not a bug. */
+    if (modifier == DRM_FORMAT_MOD_QCOM_COMPRESSED)
+        return hybris_gbm_format_supports_ubwc(format) ? 1 : 0;
     if (modifier != DRM_FORMAT_MOD_LINEAR && modifier != DRM_FORMAT_MOD_INVALID)
         return 0;
-    return 1;   /* all supported formats are single-plane linear */
+    return 1;
 }
 
 static struct gbm_device *hybris_device_create(int fd, uint32_t gbm_backend_version){
@@ -847,7 +919,14 @@ static struct gbm_device *hybris_device_create(int fd, uint32_t gbm_backend_vers
    device->v0.destroy = hybris_gbm_device_destroy;
    device->v0.bo_get_fd = hybris_gbm_bo_get_fd;
    device->v0.bo_get_handle = hybris_gbm_bo_get_handle_for_plane;
-   device->v0.bo_get_stride = hybris_gbm_bo_get_stride;
+   /* pdx224: libgbm's gbm_bo_get_stride_for_plane(bo, plane) dispatches straight
+    * to this slot, so it MUST honour `plane`. It was wired to
+    * hybris_gbm_bo_get_stride(), which ignores the argument and returns plane
+    * 0's stride for every plane, while the plane-aware
+    * hybris_gbm_bo_get_stride_for_plane() sat here as dead code, wired to
+    * nothing. Consequence: an imported multi-plane bo (e.g. NV12 from the camera
+    * or a video decoder) reported the luma pitch for its chroma plane. */
+   device->v0.bo_get_stride = hybris_gbm_bo_get_stride_for_plane;
    device->v0.bo_get_modifier = hybris_gbm_bo_get_modifier;
    device->v0.bo_get_planes = hybris_gbm_bo_get_plane_count;
    device->v0.bo_get_plane_fd = hybris_gbm_bo_get_fd_for_plane;
